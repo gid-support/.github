@@ -1,0 +1,160 @@
+
+name: Security scan
+
+on:
+  workflow_call:
+    inputs:
+      language:
+        description: 'go | node | python'
+        required: true
+        type: string
+      severity:
+        description: 'Severities that fail the run'
+        required: false
+        default: 'CRITICAL,HIGH'
+        type: string
+      blocking-scanners:
+        description: 'Scanners that can fail the run'
+        required: false
+        default: 'vuln,secret'
+        type: string
+      go-version-file:
+        required: false
+        default: 'go.mod'
+        type: string
+      scan-ref:
+        description: 'Path to scan, relative to repo root'
+        required: false
+        default: '.'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    name: Vulnerability assessment (${{ inputs.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # --- Blocking dependency and secret scan ---
+      - name: Trivy — blocking
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: ${{ inputs.scan-ref }}
+          scanners: ${{ inputs.blocking-scanners }}
+          severity: ${{ inputs.severity }}
+          ignore-unfixed: true
+          exit-code: '1'
+          format: table
+
+      # --- Go ---
+      - name: govulncheck
+        if: inputs.language == 'go'
+        uses: golang/govulncheck-action@v1.1.0
+        with:
+          go-version-file: ${{ inputs.go-version-file }}
+          repo-checkout: false
+
+      - name: gosec (advisory)
+        if: inputs.language == 'go'
+        continue-on-error: true
+        uses: securego/gosec@v2.29.0
+        with:
+          args: '-severity medium -confidence medium -fmt text ./...'
+
+      # --- Node.js / Next.js ---
+      - name: Semgrep — Node.js (advisory)
+        if: inputs.language == 'node'
+        continue-on-error: true
+        working-directory: ${{ inputs.scan-ref }}
+        run: |
+          pipx install semgrep
+          semgrep scan --config p/typescript --config p/react \
+            --error --metrics off --quiet
+
+      # --- Python ---
+      - name: Set up Python
+        if: inputs.language == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: pip-audit — Python dependencies
+        if: inputs.language == 'python'
+        working-directory: ${{ inputs.scan-ref }}
+        run: |
+          python -m pip install --upgrade pip pip-audit
+
+          if [ -f requirements.txt ]; then
+            pip-audit -r requirements.txt
+          elif [ -f requirements.lock ]; then
+            pip-audit -r requirements.lock
+          else
+            echo "::warning::No requirements.txt or requirements.lock found. Trivy remains responsible for dependency scanning."
+          fi
+
+      - name: Semgrep — Python (advisory)
+        if: inputs.language == 'python'
+        continue-on-error: true
+        working-directory: ${{ inputs.scan-ref }}
+        run: |
+          pipx install semgrep
+          semgrep scan --config p/python \
+            --error --metrics off --quiet
+
+      # --- Advisory IaC / Dockerfile scan ---
+      - name: Trivy — IaC and Dockerfile (advisory)
+        if: always()
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: config
+          scan-ref: ${{ inputs.scan-ref }}
+          severity: 'CRITICAL,HIGH,MEDIUM'
+          exit-code: '0'
+          format: table
+          output: advisory-config.txt
+
+      # --- Advisory lower-severity dependency scan ---
+      - name: Trivy — below threshold (advisory)
+        if: always()
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: ${{ inputs.scan-ref }}
+          scanners: vuln,secret
+          severity: 'MEDIUM,LOW'
+          ignore-unfixed: true
+          exit-code: '0'
+          format: table
+          output: advisory-vuln.txt
+
+      - name: Publish advisory findings
+        if: always()
+        continue-on-error: true
+        run: |
+          emit () {
+            echo "### $1"
+            if [ -s "$2" ]; then
+              echo '```'
+              cat "$2"
+              echo '```'
+            else
+              echo "No findings available."
+            fi
+            echo
+          }
+
+          {
+            echo "## Advisory findings — not blocking"
+            echo
+            emit "IaC / Dockerfile" advisory-config.txt
+            emit "MEDIUM / LOW dependency CVEs" advisory-vuln.txt
+          } >> "$GITHUB_STEP_SUMMARY"
